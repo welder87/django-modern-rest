@@ -290,3 +290,98 @@ class LeakyBucket(BaseThrottleAlgorithm):
     def _ceil_div(self, dividend: int, divisor: int) -> int:
         """Integer ceiling division for non-negative values."""
         return (dividend + divisor - 1) // divisor
+
+
+class TokenBucket(BaseThrottleAlgorithm):
+    """Token bucket algorithm."""
+
+    __slots__ = ()
+
+    @override
+    def access(
+        self,
+        endpoint: 'Endpoint',
+        controller: 'Controller[BaseSerializer]',
+        throttle: 'SyncThrottle | AsyncThrottle',
+        cache_object: CachedRateLimit | None,
+    ) -> CachedRateLimit:
+        """Check access; raise when the bucket is empty."""
+        # Lazy token refill:
+        cache_object, _now = self._process_cache(throttle, cache_object)
+        # Do the check:
+        if cache_object['history'][0] < throttle.duration_in_seconds:
+            raise TooManyRequestsError(
+                headers=self._report_usage(
+                    endpoint,
+                    controller,
+                    throttle,
+                    cache_object,
+                    cache_object['time'],
+                ),
+            )
+        # Subtract one scaled unit for the performed request:
+        cache_object['history'][0] -= throttle.duration_in_seconds
+        return cache_object
+
+    @override
+    def report_usage(
+        self,
+        endpoint: 'Endpoint',
+        controller: 'Controller[BaseSerializer]',
+        throttle: 'SyncThrottle | AsyncThrottle',
+        cache_object: CachedRateLimit | None,
+    ) -> dict[str, str]:
+        """Lazy token refill."""
+        cache_object, now = self._process_cache(throttle, cache_object)
+        return self._report_usage(
+            endpoint,
+            controller,
+            throttle,
+            cache_object,
+            now=now,
+            report_all=False,
+        )
+
+    def _process_cache(
+        self,
+        throttle: 'SyncThrottle | AsyncThrottle',
+        cache_object: CachedRateLimit | None,
+    ) -> tuple[CachedRateLimit, int]:
+        now = int(time.time())
+        scaled_units = throttle.max_requests * throttle.duration_in_seconds
+        if cache_object is None:
+            # The bucket starts full
+            return CachedRateLimit(history=[scaled_units], time=now), now
+        # Refill the tokens for the elapsed time, excluding negative values
+        elapsed = max(0, now - cache_object['time'])
+        tokens = min(
+            scaled_units,
+            cache_object['history'][0] + elapsed * throttle.max_requests,
+        )
+        return CachedRateLimit(history=[tokens], time=now), now
+
+    def _report_usage(
+        self,
+        endpoint: 'Endpoint',
+        controller: 'Controller[BaseSerializer]',
+        throttle: 'SyncThrottle | AsyncThrottle',
+        cache_object: CachedRateLimit,
+        now: int,
+        *,
+        report_all: bool = True,
+    ) -> dict[str, str]:
+        remaining = cache_object['history'][0] // throttle.duration_in_seconds
+        # How many whole requests can be made right now
+        missing = throttle.duration_in_seconds - cache_object['history'][0]
+        reset = self._ceil_div(max(0, missing), throttle.max_requests)
+        return throttle.collect_response_headers(
+            endpoint,
+            controller,
+            remaining=remaining,
+            reset=reset,
+            report_all=report_all,
+        )
+
+    def _ceil_div(self, dividend: int, divisor: int) -> int:
+        """Integer ceiling division for non-negative values."""
+        return (dividend + divisor - 1) // divisor
